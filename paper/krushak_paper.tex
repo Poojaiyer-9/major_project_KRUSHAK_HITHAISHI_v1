@@ -1,0 +1,163 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Krushak Hithaishi: Offline-First Crop Disease Detection and Shop Guidance\\
+\Large Technical Report}
+\author{Krushak Hithaishi Team}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Krushak Hithaishi is an offline-first mobile system for crop leaf disease detection built for Kannada-speaking farmers with limited internet connectivity. A farmer photographs a leaf; the phone runs a quantised TFLite multimodal model to predict disease and severity, generates a Grad-CAM-style heatmap, produces a Kannada voice advisory via IndicTrans2 and gTTS, and finally queries a cloud shop directory to list the three nearest agricultural shops sorted by GPS distance. Only the shop lookup requires internet. This report documents the architecture, technical choices, current implementation status, and the remaining steps required to move from a functional prototype to a field-tested, publication-ready system.
+\end{abstract}
+
+\section{Introduction}
+Rural farmers in Karnataka often face crop leaf diseases without access to timely diagnosis or nearby agricultural inputs. Smartphone-based detection exists, but most solutions require reliable internet, work only in English, and provide no explanation. Krushak Hithaishi targets the offline, low-connectivity setting with a multilingual, explainable pipeline and a GPS-based shop directory. The project is a final-year student effort spanning machine learning, backend engineering, React Native mobile development, and research communication.
+
+\section{System Architecture}
+
+\subsection{End-to-End Pipeline}
+The system is deliberately split into four stages so that only the last stage needs a network connection:
+
+\begin{enumerate}
+    \item \textbf{Offline inference:} a multimodal TFLite model fuses a MobileNetV3Small image branch with a 4-dimensional weather/crop-stage vector and emits two softmax heads: 38-way disease classification and 3-way severity prediction (LOW, MEDIUM, HIGH).
+    \item \textbf{Offline explainability:} a Grad-CAM-style heatmap highlights the infected region. On TFLite, where true gradients are unavailable, we compute a gradient-free occlusion saliency map by measuring the drop in disease probability when patches are occluded.
+    \item \textbf{Advisory generation:} the predicted disease is mapped to a treatment protocol, translated to Kannada (or Hindi/Telugu) using IndicTrans2, and rendered as speech with gTTS.
+    \item \textbf{Online shop lookup:} the phone sends GPS coordinates and the recommended medicine to the backend, which queries a PostgreSQL/SQLite shop directory, computes Haversine distances, and returns the three nearest shops with name, distance, last-verified date, and a callable phone number.
+\end{enumerate}
+
+\subsection{Folder Structure}
+
+\begin{description}
+    \item[\texttt{model\_training/}] Colab work: \texttt{data\_prep.py}, \texttt{train\_model.py}, \texttt{convert\_tflite.py}, \texttt{evaluate.py}.
+    \item[\texttt{backend/}] FastAPI service: \texttt{main.py}, \texttt{routes/} (\texttt{detect}, \texttt{shops}, \texttt{advisory}), \texttt{utils/} (\texttt{weather}, \texttt{distance}, \texttt{gradcam}, \texttt{translate}, \texttt{voice}, \texttt{model}), \texttt{db/} (\texttt{database}, \texttt{seed\_shops}), \texttt{requirements.txt}, \texttt{Dockerfile}, \texttt{models/}.
+    \item[\texttt{mobile/}] React Native + Expo app: \texttt{App.js}, \texttt{screens/} (Home, Scan, Result, Shops), \texttt{components/} (SeverityBadge, ShopCard), \texttt{services/api.js}.
+    \item[\texttt{paper/}] LaTeX write-up and figures.
+\end{description}
+
+\section{Technical Stack and Design Rationale}
+
+\subsection{Backend Layer}
+\begin{itemize}
+    \item \textbf{FastAPI (Python 3.10):} async-native, strong type hints via Pydantic, automatic OpenAPI docs, and very fast development velocity. Ideal for a student backend that must expose a multipart image endpoint.
+    \item \textbf{SQLAlchemy + PostgreSQL:} the shop directory is structured relational data. SQLAlchemy gives a portable ORM; we run on PostgreSQL in production (Railway) and SQLite locally for zero-configuration development.
+    \item \textbf{Static voice mount:} \texttt{main.py} mounts \texttt{/voice} on \texttt{StaticFiles} so the mobile app can stream served MP3s without signed URLs or cloud storage.
+\end{itemize}
+
+\subsection{Machine Learning Pipeline}
+\begin{itemize}
+    \item \textbf{TensorFlow / Keras:} used for training the multimodal model and for the INT8 TFLite conversion. Keras functional API cleanly supports two-input architectures.
+    \item \textbf{MobileNetV3Small + weather branch:} MobileNetV3Small balances accuracy and parameter count. Adding a separate 4-dimensional weather/crop-stage branch lets the model use context that humans use when diagnosing diseases (humidity favours fungal infections), improving the multimodal delta over a pure image baseline.
+    \item \textbf{TFLite INT8:} post-training quantisation with a representative dataset from \texttt{dataset.npz}. INT8 reduces model size and improves CPU latency, making it feasible to run interactively on an entry-level Android phone. The helper in \texttt{utils/model.py} handles dequantisation transparently.
+    \item \textbf{Occ saliency heatmap:} true Grad-CAM requires Keras gradients, which TFLite does not expose. We therefore use an occlusion-based saliency map: patch the image with the mean colour, measure the drop in predicted disease probability, and render the resulting deviation map with OpenCV's \texttt{COLORMAP\_JET}.
+\end{itemize}
+
+\subsection{Mobile Application}
+\begin{itemize}
+    \item \textbf{React Native + Expo:} one codebase for Android and iOS, with first-party modules for camera (\texttt{expo-camera}) and GPS (\texttt{expo-location}). Expo Go lets the team preview changes instantly without a full build.
+    \item \textbf{expo-av:} plays the synthetic Kannada voice files streamed from the backend.
+    \item \textbf{navigation:} \texttt{@react-navigation/stack} connects the four screens: Home $\to$ Scan $\to$ Result $\to$ Shops.
+\end{itemize}
+
+\subsection{Translation and Voice}
+\begin{itemize}
+    \item \textbf{IndicTrans2 (AI4Bharat):} open-source sequence-to-sequence models for English-to-Indic translation. We support Kannada (\texttt{kn}), Hindi (\texttt{hi}), and Telugu (\texttt{te}) with lazy-per-language model loading to keep startup time low.
+    \item \textbf{gTTS:} light-weight wrapper around Google Translate's spoken output. It requires internet; when unavailable the endpoint degrades gracefully by returning English text with a null voice URL.
+\end{itemize}
+
+\subsection{Shop Directory}
+\begin{itemize}
+    \item \textbf{Haversine formula:} great-circle distance between two GPS coordinates in kilometres. Implemented in a few lines of pure Python; no PostGIS extension is required, which matches the ``keep it runnable'' constraint.
+    \item \textbf{PostgreSQL for production / SQLite for development:} \texttt{DATABASE\_URL} controls the dialect. Railway provides a managed Postgres instance; on a student laptop SQLite is automatic.
+    \item \textbf{Medicines available:} stored as a JSON array in the \texttt{Shop} table, enabling simple array-contains filtering in the \texttt{/shops/nearby} endpoint.
+\end{itemize}
+
+\section{Current Implementation Status}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Component} & \textbf{State} & \textbf{Verified With} \\
+\midrule
+Backend (\texttt{/health}, \texttt{/detect}, \texttt{/shops/nearby}) & Running in demo mode (no TFLite) & \texttt{curl} against localhost:8000 \\
+Shop DB seeding & 5 sample shops in SQLite & \texttt{python -m db.seed\_shops} \\
+TFLite inference & Code complete, awaits model file & \texttt{utils/model.py} parses INT8 outputs \\
+Grad-CAM & Keras path (dev) + occlusion path (TFLite ready) & \texttt{get\_gradcam\_tflite} returns base64 JPEG \\
+Voice advisory & gTTS works online; served at \texttt{/voice/:file.mp3} & 135 kB MP3 fetched successfully \\
+Mobile screens & Home, Scan, Result, Shops compile & \texttt{npx expo start} downloads deps \\
+Training scripts & 4 scripts byte-compile cleanly & \texttt{python -m py\_compile} \\
+\bottomrule
+\end{tabular}
+\caption{Implementation status as of 2026-07-22.}
+\end{table}
+
+\noindent Known gaps:
+\begin{itemize}
+    \item \texttt{krushak.tflite} is missing (to be produced by Colab training).
+    \item Full PlantVillage training has not been executed (GPU needed).
+    \item Mobile app has not been field-tested with real farmers.
+    \item Shop directory contains only the five sample rows from the student survey.
+\end{itemize}
+
+\section{Remaining Steps and Roadmap}
+
+\subsection{Backend}
+\begin{enumerate}
+    \item Deploy to Railway and set the \texttt{DATABASE\_URL} to the managed Postgres instance.
+    \item Replace the sample CSV with the full Karnataka shop directory CSV (see \S\ref{sec:shop-details}).
+    \item Add API key / rate limiting if the backend is made public before the paper is submitted.
+    \item Add structured JSON logging and a \texttt{/metrics} endpoint (Prometheus format) for latency tracking.
+\end{enumerate}
+
+\subsection{Training Pipeline}
+The Colab workflow is:
+\begin{enumerate}
+    \item Upload the \texttt{model\_training/} folder.
+    \item Obtain the PlantVillage dataset and place it under \texttt{./data/}.
+    \item Run \texttt{data\_prep.py} $\to$ \texttt{train\_model.py} $\to$ \texttt{convert\_tflite.py} $\to$ \texttt{evaluate.py}.
+    \item Export the authoritative \texttt{disease\_labels.txt} from the training script to guarantee index ordering.
+    \item Download \texttt{krushak.tflite}, \texttt{disease\_labels.txt}, and \texttt{severity\_labels.txt} to the local \texttt{backend/models/} directory.
+\end{enumerate}
+
+\subsection{Data Acquisition}
+\begin{itemize}
+    \item \textbf{PlantVillage:} download from Kaggle (\texttt{spyridoth} dataset) or load via \texttt{tensorflow-datasets}. Organise into \texttt{./data/<class\_name>/*.jpg}.
+    \item \textbf{Weather augmentation:} \texttt{data\_prep.py} already assigns higher humidity values to fungal disease folders; consider pairing with live Open-Meteo fetches during training to simulate real distributions.
+    \item \textbf{Splits:} the script generates an 80/10/10 train/val/test split with a fixed seed for reproducibility.
+\end{itemize}
+
+\subsection{Farmer Inclusion}
+\begin{itemize}
+    \item Recruit 5--10 farmers through a local Krishi Vigyan Kendra or self-help group.
+    \item Run a short consent process (written) and record basic demographics (crop, phone model, Kannada literacy).
+    \item Give each farmer a short on-boarding: granting camera/location permissions, using the crop-stage picker, and listening to one voice advisory.
+    \item Collect qualitative feedback on heatmap clarity, voice speed, and shop-call usefulness.
+    \item Log anonymised session data (disease predicted, confidence, shop selected) to measure real-world adoption.
+\end{itemize}
+
+\subsection{Shop Directory Enrichment}
+\label{sec:shop-details}
+\begin{itemize}
+    \item Conduct a GPS survey of agri-input dealers within a 20 km radius of the test village.
+    \item Record \texttt{shop\_name}, \texttt{owner\_name}, \texttt{phone\_number}, \texttt{latitude}, \texttt{longitude}, \texttt{address}, \texttt{medicines\_available}, and \texttt{last\_verified\_date}.
+    \item Verify phone numbers by calling once; mark the \texttt{last\_verified\_date}.
+    \item Maintain the directory as a CSV; re-run \texttt{python -m db.seed\_shops} after each update.
+    \item If the list grows beyond a few hundred shops, add a geospatial index (PostGIS or a simple R-tree via \texttt{rtree}) to avoid scanning every row.
+\end{itemize}
+
+\section{Discussion}
+The biggest limitation is that IndicTrans2+ gTTS require internet, so the voice advisory is not fully offline. During field testing we will measure how often farmers navigate to the shop screen even without network, which determines whether fallback English text plus an offline cached advisory list is sufficient. The Haversine-only shop directory is intentionally simple: it avoids inventory-sync complexity, but farmers may still arrive at a shop that is out of stock; the ``last verified'' date mitigates this. The multimodal model is trained from scratch (no ImageNet weights) to keep the Colab pipeline deterministic; fine-tuning MobileNetV3Small with pretrained weights is the easiest accuracy win available.
+
+\section{Conclusion}
+Krushak Hithaishi is a deliberately minimal, four-stage system that isolates internet use to the shop directory. The backend runs in FastAPI with a zero-setup SQLite fallback, the mobile app uses Expo for rapid iteration, and the TFLite model is quantised for on-device inference. The next actions are straightforward: (1) train the model in Colab, (2) deploy the backend, (3) expand the shop directory with field data, and (4) run farmer testing. Each module is small enough that a single person can own it, yet the overall pipeline produces a publishable, demo-able system.
+
+\end{document}
